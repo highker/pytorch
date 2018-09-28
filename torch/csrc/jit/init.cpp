@@ -37,6 +37,7 @@
 #include "torch/csrc/jit/serialization.h"
 #include "torch/csrc/jit/operator.h"
 #include "torch/csrc/jit/fusers/interface.h"
+#include "torch/csrc/jit/async.h"
 
 #include <pybind11/functional.h>
 
@@ -302,6 +303,13 @@ void initJITBindings(PyObject *module) {
         return op->schema();
       });
   });
+
+  py::class_<async::Future>(m, "Future")
+  .def("get", &async::Future::get);
+
+  m.def("Fork", &async::fork);
+
+  m.def("Wait", &async::wait);
 
 
   initPythonIRBindings(module);

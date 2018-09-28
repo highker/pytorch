@@ -51,6 +51,9 @@ compiled_weak_fns = weakref.WeakKeyDictionary()
 COMPILATION_PENDING = object()
 COMPILED = object()
 
+Future = torch._C.Future
+Fork = torch._C.Fork
+Wait = torch._C.Wait
 
 @contextlib.contextmanager
 def scope(scope_name):
