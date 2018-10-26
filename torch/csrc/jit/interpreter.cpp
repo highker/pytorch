@@ -637,26 +637,41 @@ struct CodeImpl {
 
 // InterpreterState state that and used to compute a Code
 struct InterpreterStateImpl {
-  InterpreterStateImpl(const Code & code)
+  InterpreterStateImpl(const Code & code, InterpreterState& parent_)
   : function(code.pImpl),
     int_data(function->int_data.data()),
     bool_data(function->bool_data),
-    registers(function->register_size) {
+    registers(function->register_size),
+    parent(parent_) {
   }
-  void run(Stack & stack) {
+
+  Future run(Stack & stack) {
     // std::cout << *function->graph << "\n";
     // function->dump(std::cout);
     size_t pc = current_pc;
     auto & instructions = function->instructions;
     size_t last = instructions.size();
-    while(pc < last) {
+    Future blocking_future;
+    bool suspended = false;
+    while(pc < last && !suspended) {
+        suspended = false;
         // std::cout << "executing " << pc << ": ";
         // function->dumpInstruction(std::cout, pc);
         // std::cout << "\n";
         try {
           auto & inst = instructions[pc];
           loadTensorsFromRegisters(inst.inputs, stack);
-          size_t new_pc = pc + 1 + inst.callback(stack);
+          size_t new_pc = pc + 1;
+          try {
+            new_pc += inst.callback(stack);
+          } catch (NewFuture new_future) {
+            parent.tasks.push(new_future.future);
+            parent.interpreters.emplace(std::move(new_future.interpreters));
+            parent.stacks.emplace(std::move(new_future.stacks));
+          } catch (Suspend suspend) {
+            blocking_future = suspend.future;
+            suspended = true;
+          }
           for(int i = inst.outputs.size - 1; i >= 0; i--) {
             int reg = get(inst.outputs,i);
             registers[reg] = pop(stack);
@@ -671,7 +686,18 @@ struct InterpreterStateImpl {
         }
     }
     current_pc = pc;
+    if (suspended) {
+      self.blockBy(blocking_future);
+    } else {
+      self.setDone();
+    }
+    return self;
   }
+
+  Future runAsync() {
+    return run(*stack_ptr);
+  }
+
   int get(const ListHandle<int> & list, int i) {
     return int_data[list.start + i];
   };
@@ -715,7 +741,9 @@ struct InterpreterStateImpl {
   std::vector<IValue> registers;
 
   // single buffer for input/output calls to ATen functions, so that we do not reallocate
-  Stack stack;
+  Stack* stack_ptr = nullptr;
+  InterpreterState& parent;
+  Future self;
 };
 
 std::ostream & operator<<(std::ostream & out, const Code & code) {
@@ -737,7 +765,38 @@ InterpreterState::InterpreterState(const Code & code)
 InterpreterState::~InterpreterState() = default;
 
 void InterpreterState::run(Stack & stack) {
-  return pImpl->run(stack);
+  pImpl->self = Future(*this, stack);
+  auto future = pImpl->run(stack);
+  if (future.ready) {
+    return;
+  }
+
+  // We encountered a fork; fall back to use runAsync
+  tasks.push(future);
+  while (!tasks.empty()) {
+    auto task = tasks.pop();
+    if (task.done()) {
+      continue;
+    }
+    if (!task.ready()) {
+      tasks.push(task);
+      continue;
+    }
+
+    auto result = task.runAsync();
+    if (!result.done()) {
+      tasks.push(result);
+    }
+  }
+}
+
+void InterpreterState::bindStack(Stack & stack) {
+  pImpl->stack = &stack;
+}
+
+Future InterpreterState::runAysnc() {
+  JIT_ASSERT(pImpl->stack != nullptr);
+  return pImpl->runAsync();
 }
 
 InterpreterState InterpreterState::clone() const {

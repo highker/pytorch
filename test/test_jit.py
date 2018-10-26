@@ -9405,6 +9405,46 @@ class TestAsync(JitTestCase):
                 fut = torch.jit._fork(x)
                 return fut
 
+    def test_async_multi_forks(self):
+        # Have some slow functions
+        @torch.jit.script
+        def foo1(x):
+            return torch.neg(x).t() + x
+
+        @torch.jit.script
+        def foo2(x, y):
+            return torch.neg(x).t() + x + torch.neg(y).t()
+
+        @torch.jit.script
+        def foo3(x, y, z):
+            return torch.neg(z).t() + y.t() + x
+
+        x1 = torch.rand(100, 100)
+        x2 = torch.rand(100, 100)
+        x3 = torch.rand(100, 100)
+
+        @torch.jit.script
+        def wait_script(x1, x2, x3):
+            f1 = torch.jit._fork(foo1, x1)
+            f2 = torch.jit._fork(foo2, x1, x2)
+            f3 = torch.jit._fork(foo3, x1, x2, x3)
+            f4 = torch.jit._fork(foo1, x2)
+            f5 = torch.jit._fork(foo2, x2, x3)
+
+            y1 = torch.jit._wait(f1)
+            y2 = torch.jit._wait(f2)
+            y3 = torch.jit._wait(f3)
+            y4 = torch.jit._wait(f4)
+            y5 = torch.jit._wait(f5)
+            return y1, y2, y3, y4, y5
+
+        y1, y2, y3, y4, y5 = wait_script(x1, x2, x3)
+        self.assertEqual(y1, foo1(x1))
+        self.assertEqual(y2, foo2(x1, x2))
+        self.assertEqual(y3, foo3(x1, x2, x3))
+        self.assertEqual(y4, foo1(x2))
+        self.assertEqual(y5, foo2(x2, x3))
+
 for test in autograd_method_tests:
     add_autograd_test(*test)
 

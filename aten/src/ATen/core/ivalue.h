@@ -457,19 +457,66 @@ struct CAFFE2_API IValue final {
 
 // Future
 struct C10_EXPORT ivalue::Future final : c10::intrusive_ptr_target {
-  explicit Future(IValue result_) : result(result_), ready(true) {}
+  using Stack = std::vector<c10::IValue>;
+  explicit Future(
+      InterpreterState& state_,
+      Stack& stack)
+    : state(&state_),
+      stack(&stack_) {
+    state->bindStack(*stack);
+  }
 
-  IValue get() const {
-    AT_ASSERT(ready);
-    return result;
+  // A dummy complete future
+  explicit Future() {
+    done = std::make_shared<atomic<bool>>(true);
+  };
+
+
+  Future runAsync() {
+    AT_ASSERT(ready());
+    if (*wait_for_blocker) {
+      push(*stack, blocker.get());
+      *wait_for_blocker = false;
+    }
+    auto future = state->runAsync();
+    *done = future.done();
+    return future;
+  }
+
+  IValue get() {
+    AT_ASSERT(done());
+    return pop(stack);
+  }
+
+  bool ready() {
+    // nothing blocks me; ok to proceed
+    return blocker.done();
+  }
+
+  bool done() {
+    return ready() && *done;
+  }
+
+  void setDone() {
+    *done = true;
+  }
+
+  void blockBy(Future blocker_) {
+    *wait_for_blocker = true;
+    blocker = blocker_;
   }
 
   CAFFE2_API friend std::ostream& operator<<(
       std::ostream& out,
       const Future& v);
 
-  IValue result;
-  bool ready = false;
+ private:
+  // Future does not own anything.
+  InterpreterState* state = nullptr;
+  Stack* stack = nullptr;
+  Future blocker;
+  std::shared_ptr<atomic<bool>> wait_for_blocker = std::make_shared<atomic<bool>>(false);
+  std::shared_ptr<atomic<bool>> done = std::make_shared<atomic<bool>>(false);
 };
 
 #undef TORCH_FORALL_TAGS

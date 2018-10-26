@@ -10,6 +10,7 @@
 #include "torch/csrc/jit/custom_operator.h"
 
 #include "torch/csrc/variable_tensor_functions.h"
+#include "torch/csrc/utils/memory.h"
 
 #include <exception>
 #include <iostream>
@@ -538,12 +539,22 @@ RegisterOperators reg({
     Operator(
         prim::fork,
         [](Node* node) {
-          Code code(node->g(attr::Subgraph));
+          int n_inputs = node->inputs().size();
           JIT_ASSERT(node->blocks().size() == 0);
           JIT_ASSERT(node->hasAttribute(attr::Subgraph));
           return [=](Stack& stack) {
-            InterpreterState(code).run(stack);
-            push(stack, Future(pop(stack)));
+            // Move inputs to a separate stack
+            auto copied_stack = torch::make_unique<Stack>(
+                stack.begin() + (stack.size() - n_inputs),
+                stack.end());
+            drop(stack, n_inputs);
+
+            auto state = torch::make_unique<InterpreterState>(
+                node->g(attr::Subgraph));
+
+            Future future(*state, *copied_stack);
+            push(stack, future);
+            throw NewFuture(future, std::move(state), std::move(copied_stack));
             return 0;
           };
         }),
@@ -551,10 +562,11 @@ RegisterOperators reg({
         "aten::wait(Future(t) self) -> t",
         [](Node* node) {
           return [=](Stack& stack) {
-            push(stack, pop(stack).toFuture()->get());
-            return 0;
-          };
-        }),
+            throw Suspend(pop(stack).toFuture());
+          });
+          return 0;
+        };
+      }),
 });
 
 // define implementations for primitive number ops

@@ -1,8 +1,10 @@
 #pragma once
 #include <memory>
+#include <queue>
 #include <vector>
 #include "c10/util/Optional.h"
 
+#include "torch/csrc/jit/ivalue.h"
 #include "torch/csrc/WindowsTorchApiMacro.h"
 
 namespace at {
@@ -46,6 +48,10 @@ private:
 struct InterpreterState {
   InterpreterState(const Code & code);
   void run(Stack & stack);
+  // runAsync assume InterpreterState "owns" the stack
+  // though in reality it is not.
+  Future runAysnc();
+  void bindStack(Stack & stack);
   ~InterpreterState();
   // create a copy of InterpreterState with its current state
   // used when retain_graph=True
@@ -53,6 +59,37 @@ struct InterpreterState {
 private:
   InterpreterState(InterpreterStateImpl * pImpl);
   std::shared_ptr<InterpreterStateImpl> pImpl;
+  std::queue<Future> tasks;
+  std::set<std::unique_ptr<InterpreterState>> interpreters;
+  std::set<std::unique_ptr<Stack>> stacks;
+};
+
+struct NewFuture : public std::exception {
+  virtual const char* what() const noexcept {
+    return "NewFuture";
+  }
+
+  explicit NewFuture(
+      Future future_,
+      std::unique_ptr<InterpreterState>&& state_,
+      std::unique_ptr<Stack>&& stack_)
+    : future(future_),
+      state(std::move(state_)),
+      stack(std::move(stack_)) {};
+
+  Future future;
+  std::unique_ptr<InterpreterState> state;
+  std::unique_ptr<Stack> stack;
+};
+
+struct Suspend : public std::exception {
+  virtual const char* what() const noexcept {
+    return "Suspend";
+  }
+
+  explicit Suspend(Future future_) : future(future_) {};
+
+  Future future;
 };
 
 }}
