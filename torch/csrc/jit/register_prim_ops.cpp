@@ -11,6 +11,7 @@
 #include "torch/csrc/jit/script/jit_exception.h"
 
 #include "torch/csrc/variable_tensor_functions.h"
+#include "torch/csrc/utils/memory.h"
 
 #include <exception>
 #include <iostream>
@@ -30,6 +31,31 @@ namespace torch {
 namespace jit {
 
 namespace {
+
+// A forked thread that owns the new interpreter and stack
+struct ForkFutureTask : public at::FutureTask {
+  ForkFutureTask(
+      std::unique_ptr<InterpreterState>&& state_,
+      std::unique_ptr<Stack>&& stack_)
+    : state(std::move(state_)),
+      stack(std::move(stack_)) {};
+
+  c10::intrusive_ptr<Future> runAsync() override {
+    return state->run(*stack);
+  }
+
+  IValue produce() override {
+    // Do not pop in case users ask the result more than once
+    return peek(*stack, 0, 1);
+  }
+
+  void consume(IValue&& result) override {
+    push(*stack, std::move(result));
+  }
+
+  std::unique_ptr<InterpreterState> state = nullptr;
+  std::unique_ptr<Stack> stack = nullptr;
+};
 
 Operation noop(Node* n) {
   return [](Stack& stack) { return 0; };
@@ -548,12 +574,22 @@ RegisterOperators reg({
     Operator(
         prim::fork,
         [](Node* node) {
-          Code code(node->g(attr::Subgraph));
+          int n_inputs = node->inputs().size();
           JIT_ASSERT(node->blocks().size() == 0);
           JIT_ASSERT(node->hasAttribute(attr::Subgraph));
           return [=](Stack& stack) {
-            InterpreterState(code).run(stack);
-            push(stack, Future(pop(stack)));
+            // Move inputs to a separate stack
+            auto copied_stack = torch::make_unique<Stack>(
+                stack.end() - n_inputs,
+                stack.end());
+            drop(stack, n_inputs);
+
+            auto state = torch::make_unique<InterpreterState>(
+                node->g(attr::Subgraph));
+
+            push(stack, Future(std::make_shared<ForkFutureTask>(
+                std::move(state), std::move(copied_stack))));
+            // TODO: ideally we need to move the future to the task queue at this point
             return 0;
           };
         }),
@@ -561,7 +597,7 @@ RegisterOperators reg({
         "aten::wait(Future(t) self) -> t",
         [](Node* node) {
           return [=](Stack& stack) {
-            push(stack, pop(stack).toFuture()->get());
+            throw Suspend(pop(stack).toFuture());
             return 0;
           };
         }),

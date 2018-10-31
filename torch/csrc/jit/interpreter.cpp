@@ -644,24 +644,38 @@ struct InterpreterStateImpl {
     bool_data(function->bool_data),
     registers(function->register_size) {
   }
-  void run(Stack & stack) {
+
+  c10::intrusive_ptr<Future> run(Stack & stack) {
     // std::cout << *function->graph << "\n";
     // function->dump(std::cout);
     size_t pc = current_pc;
     auto & instructions = function->instructions;
     size_t last = instructions.size();
-    while(pc < last) {
+    c10::intrusive_ptr<Future> blocker;
+
+    if (suspended) {
+      registerOutputs(*current_inst, stack);
+      suspended = false;
+    }
+
+    while(pc < last && !suspended) {
+        suspended = false;
         // std::cout << "executing " << pc << ": ";
         // function->dumpInstruction(std::cout, pc);
         // std::cout << "\n";
         try {
           auto & inst = instructions[pc];
+          current_inst = &inst;
           loadTensorsFromRegisters(inst.inputs, stack);
-          size_t new_pc = pc + 1 + inst.callback(stack);
-          for(int i = inst.outputs.size - 1; i >= 0; i--) {
-            int reg = get(inst.outputs,i);
-            registers[reg] = pop(stack);
-            // std::cout << "pop reg[" << reg << "];\n" << registers[reg] << "\n";
+          size_t new_pc = pc + 1;
+          try {
+            new_pc += inst.callback(stack);
+          } catch (Suspend& suspend) {
+            blocker = suspend.blocker;
+            suspended = true;
+          }
+          if (!suspended) {
+            registerOutputs(inst, stack);
           }
           pc = new_pc;
         } catch(std::exception & e) {
@@ -677,7 +691,13 @@ struct InterpreterStateImpl {
         }
     }
     current_pc = pc;
+    if (suspended) {
+      return blocker;
+    }
+    // return a completed future
+    return c10::make_intrusive<Future>();
   }
+
   int get(const ListHandle<int> & list, int i) {
     return int_data[list.start + i];
   };
@@ -696,12 +716,21 @@ struct InterpreterStateImpl {
 
     }
   }
+  void registerOutputs(const Instruction& inst, Stack & stack) {
+    for (int i = inst.outputs.size - 1; i >= 0; --i) {
+      int reg = get(inst.outputs, i);
+      registers[reg] = pop(stack);
+      // std::cout << "pop reg[" << reg << "];\n" << registers[reg] << "\n";
+    }
+  }
   // note: it may seem unnecessary to keep the current_pc inside InterpreterState
   // since InterpreterState::run completes the function. However, in the
   // future we will end up with interpreters that can suspend (e.g. for asynchrony)
   // so we keep this design in place eventhough we removed the 'staging'
   // that it was originally used for.
   size_t current_pc = 0;
+  Instruction* current_inst = nullptr;
+  bool suspended = false;
   std::shared_ptr<CodeImpl> function; // keep function alive
   // these are just copies of function to prevent indirections in interpreter
   int * int_data;
@@ -742,7 +771,7 @@ InterpreterState::InterpreterState(const Code & code)
   : pImpl(new InterpreterStateImpl(code)) {}
 InterpreterState::~InterpreterState() = default;
 
-void InterpreterState::run(Stack & stack) {
+c10::intrusive_ptr<Future> InterpreterState::run(Stack & stack) {
   return pImpl->run(stack);
 }
 

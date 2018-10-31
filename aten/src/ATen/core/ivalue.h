@@ -455,21 +455,74 @@ struct CAFFE2_API IValue final {
   bool is_intrusive_ptr;
 };
 
+// An abstraction inside Future.
+// Future is an ivalue; while FutureTask is the real task that can run.
+struct FutureTask {
+  virtual c10::intrusive_ptr<ivalue::Future> runAsync() = 0;
+
+  // return the value produced by the current task
+  virtual IValue produce() = 0;
+
+  // consume the value produced by its blocking task
+  virtual void consume(IValue&& result) = 0;
+
+  virtual ~FutureTask() noexcept {}
+};
+
 // Future
 struct C10_EXPORT ivalue::Future final : c10::intrusive_ptr_target {
-  explicit Future(IValue result_) : result(result_), ready(true) {}
+  explicit Future(std::shared_ptr<FutureTask> task_) : task(task_) {
+    blocker.reset();
+  }
 
-  IValue get() const {
-    AT_ASSERT(ready);
-    return result;
+  explicit Future() : finished(true) {}
+
+  // Run the current future.
+  // The future will be blocked if it waits on another unfinished future.
+  c10::intrusive_ptr<Future> runAsync() {
+    AT_ASSERT(ready());
+    if (blocker) {
+      AT_ASSERT(!done());
+      task->consume(blocker->get());
+      blocker.reset();
+    } else if (done()) {
+      // In case we wait twice
+      return c10::make_intrusive<Future>();
+    }
+
+    auto future = task->runAsync();
+    finished = future->done();
+    if (!finished) {
+      AT_ASSERT(!blocker);
+      blocker = future;
+    }
+    return future;
+  }
+
+  // Get the result of the current future.
+  IValue get() {
+    AT_ASSERT(done());
+    return task->produce();
+  }
+
+  // Check if the current future is not blocked by any other future.
+  bool ready() {
+    return !blocker || blocker->done();
+  }
+
+  // Check if the current future has finished
+  bool done() {
+    return finished;
   }
 
   CAFFE2_API friend std::ostream& operator<<(
       std::ostream& out,
       const Future& v);
 
-  IValue result;
-  bool ready = false;
+ private:
+  std::shared_ptr<FutureTask> task = nullptr;
+  c10::intrusive_ptr<Future> blocker;
+  bool finished = false;
 };
 
 #undef TORCH_FORALL_TAGS

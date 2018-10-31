@@ -3,6 +3,7 @@
 #include <vector>
 #include "c10/util/Optional.h"
 
+#include "torch/csrc/jit/ivalue.h"
 #include "torch/csrc/WindowsTorchApiMacro.h"
 
 namespace at {
@@ -45,7 +46,7 @@ private:
 
 struct InterpreterState {
   InterpreterState(const Code & code);
-  void run(Stack & stack);
+  c10::intrusive_ptr<Future> run(Stack & stack);
   ~InterpreterState();
   // create a copy of InterpreterState with its current state
   // used when retain_graph=True
@@ -53,6 +54,17 @@ struct InterpreterState {
 private:
   InterpreterState(InterpreterStateImpl * pImpl);
   std::shared_ptr<InterpreterStateImpl> pImpl;
+};
+
+// Created by wait()
+struct Suspend : public std::exception {
+  virtual const char* what() const noexcept {
+    return "Suspend";
+  }
+
+  explicit Suspend(c10::intrusive_ptr<Future> blocker_) : blocker(blocker_) {};
+
+  c10::intrusive_ptr<Future> blocker;
 };
 
 }}

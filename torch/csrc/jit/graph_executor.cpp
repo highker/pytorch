@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -50,6 +51,26 @@ using tensor_list = std::vector<at::Tensor>;
 using Variable = autograd::Variable;
 using autograd::variable_list;
 
+struct RootFutureTask : public at::FutureTask {
+  RootFutureTask(const Code& code_, Stack& stack_)
+    : state(code_), stack(stack_) {};
+
+  c10::intrusive_ptr<Future> runAsync() override {
+    return state.run(stack);
+  }
+
+  IValue produce() override {
+    AT_ERROR("should not be called");
+  }
+
+  void consume(IValue&& result) override {
+    push(stack, std::move(result));
+  }
+
+  InterpreterState state;
+  Stack& stack;
+};
+
 struct ExecutionPlan {
   ExecutionPlan() = default;
   ExecutionPlan(std::shared_ptr<Graph> graph)
@@ -57,7 +78,35 @@ struct ExecutionPlan {
     , graph(std::move(graph)) {}
 
   void run(Stack& stack) const {
-    return InterpreterState(code).run(stack);
+    // TODO: this is a simple task queue to be extended in the future
+    std::queue<c10::intrusive_ptr<Future>> tasks;
+
+    auto root = c10::make_intrusive<Future>(
+        std::shared_ptr<at::FutureTask>(new RootFutureTask(code, stack)));
+    tasks.push(root);
+
+    // TODO: this is a simple thread pool logic to be extended in the future
+    while (!tasks.empty()) {
+      auto task = tasks.front();
+      tasks.pop();
+      if (task->done()) {
+        continue;
+      }
+      if (!task->ready()) {
+        tasks.push(task);
+        continue;
+      }
+
+      auto result = task->runAsync();
+
+      if (!result->done()) {
+        JIT_ASSERT(!task->done());
+        tasks.push(result);
+        tasks.push(task);
+      } else {
+        JIT_ASSERT(task->done());
+      }
+    }
   }
 
   operator bool() const {
