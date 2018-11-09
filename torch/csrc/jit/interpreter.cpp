@@ -639,149 +639,127 @@ struct CodeImpl {
   std::vector<bool> bool_data;
 };
 
-// InterpreterState state that and used to compute a Code
-struct InterpreterStateImpl {
-  InterpreterStateImpl(const Code & code)
-  : function(code.pImpl),
-    int_data(function->int_data.data()),
-    bool_data(function->bool_data),
-    registers(function->register_size) {
-  }
 
- private:
-  bool runImpl(Stack& stack, InterpreterState& parent) {
-    // std::cout << *function->graph << "\n";
-    // function->dump(std::cout);
-    auto & instructions = function->instructions;
-    size_t last = instructions.size();
+inline int get(int * int_data, const ListHandle<int> & list, int i) {
+  return int_data[list.start + i];
+}
 
-    while (pc < last) {
-        // std::cout << "executing " << pc << ": ";
-        // function->dumpInstruction(std::cout, pc);
-        // std::cout << "\n";
-        auto & inst = instructions[pc];
-        try {
-          loadTensorsFromRegisters(inst.inputs, stack);
-          size_t new_pc = pc + 1 + inst.callback(stack);
-          for (int i = inst.outputs.size - 1; i >= 0; --i) {
-            int reg = get(inst.outputs, i);
-            registers[reg] = pop(stack);
-            // std::cout << "pop reg[" << reg << "];\n" << registers[reg] << "\n";
-          }
-          pc = new_pc;
-        } catch (Suspend& e) {
-          // wait() expects a single input
-          JIT_ASSERT(inst.inputs.values.size == 1);
+inline bool get(const std::vector<bool> & bool_data, const ListHandle<bool> & list, int i) {
+  return bool_data[list.start + i];
+}
 
-          getOrCreateFuture();
+InterpreterStateImpl::InterpreterStateImpl(const Code & code)
+: function(code.pImpl),
+  int_data(function->int_data.data()),
+  bool_data(function->bool_data),
+  registers(function->register_size) {
+}
 
-          e.future->addCallback([parent](){
-            c10::global_work_queue.schedule(InterpreterContinuation(parent, Stack()));
-          });
+c10::intrusive_ptr<InterpreterStateImpl> InterpreterStateImpl::intrusive_from_this() {
+  c10::raw::intrusive_ptr::incref(this);
+  return c10::intrusive_ptr<InterpreterStateImpl>::reclaim(this);
+}
 
-          if (get(inst.inputs.free_flags, 0)) {
-            // make sure the register is not freed once we are waked up
-            registers[get(inst.inputs.values, 0)] = e.future;
-          }
-          return true;
-        } catch(std::exception & e) {
-          if (!instructions[pc].debug_location) {
-            throw;
-          }
-          auto msg = instructions[pc].debug_location->wrapException(e, "operation failed in interpreter");
-          if (dynamic_cast<JITException *>(&e)) {
-            throw JITException(msg);
-          } else {
-            throw std::runtime_error(msg);
-          }
-        }
-    }
-    if (future) {
-      auto num_outputs = function->preprocess.n_outputs;
-      if (num_outputs == 1) {
-        future->markCompleted(stack.back());
-      } else {
-        future->markCompleted(
-            Tuple::create(jit::last(stack, num_outputs).vec()));
-      }
-    }
+bool InterpreterStateImpl::runImpl(Stack& stack) {
+  // std::cout << *function->graph << "\n";
+  // function->dump(std::cout);
+  auto & instructions = function->instructions;
+  size_t last = instructions.size();
 
-    return false;
-  }
-
- public:
-  c10::intrusive_ptr<Future> getOrCreateFuture() {
-    if (!future) {
-      future = c10::make_intrusive<Future>();
-    }
-    return future;
-  }
-
-  c10::intrusive_ptr<Future> runAsync(Stack& stack, InterpreterState& parent) {
-    getOrCreateFuture();
-    runImpl(stack, parent);
-    return future;
-  }
-
-  void run(Stack& stack, InterpreterState& parent) {
-    if (runImpl(stack, parent)) {
-      future->wait();
-
-      auto num_outputs = function->preprocess.n_outputs;
-      if (num_outputs == 1) {
-        push(stack, future->value());
-      } else {
-        auto tuple = future->value().toTuple();
-        for (const auto& value : tuple->elements()) {
-          push(stack, value);
+  while (pc < last) {
+    // std::cout << "executing " << pc << ": ";
+    // function->dumpInstruction(std::cout, pc);
+    // std::cout << "\n";
+    auto & inst = instructions[pc];
+    try {
+      // load tensors from registers
+      for (int i = 0; i < inst.inputs.values.size; ++i) {
+        int reg = get(int_data, inst.inputs.values, i);
+        // std::cout << "push reg[" << reg << "];\n" << registers[reg] << "\n\n";
+        if (get(bool_data, inst.inputs.free_flags, i)) {
+          stack.push_back(std::move(registers[reg]));
+        } else {
+          stack.push_back(registers[reg]);
         }
       }
-    }
-  }
 
-  int get(const ListHandle<int> & list, int i) {
-    return int_data[list.start + i];
-  };
-  bool get(const ListHandle<bool> & list, int i) {
-    return bool_data[list.start + i];
-  }
-  void loadTensorsFromRegisters(const UseList & uses, Stack & stack) {
-    for(int i = 0; i < uses.values.size; i++) {
-      int reg = get(uses.values,i);
-      // std::cout << "push reg[" << reg << "];\n" << registers[reg] << "\n\n";
-      if(get(uses.free_flags,i)) {
-        stack.push_back(std::move(registers[reg]));
-      } else {
-        stack.push_back(registers[reg]);
+      size_t new_pc = pc + 1 + inst.callback(stack);
+      for (int i = inst.outputs.size - 1; i >= 0; --i) {
+        int reg = get(int_data, inst.outputs, i);
+        registers[reg] = pop(stack);
+        // std::cout << "pop reg[" << reg << "];\n" << registers[reg] << "\n";
       }
+      pc = new_pc;
+    } catch (Suspend& e) {
+      // wait() expects a single input
+      JIT_ASSERT(inst.inputs.values.size == 1);
 
+      getOrCreateFuture();
+
+      e.future->addCallback([&](){
+        c10::global_work_queue.schedule(InterpreterContinuation(
+            InterpreterState(intrusive_from_this()), Stack()));
+      });
+
+      if (get(bool_data, inst.inputs.free_flags, 0)) {
+        // make sure the register is not freed once we are waked up
+        registers[get(int_data, inst.inputs.values, 0)] = e.future;
+      }
+      return true;
+    } catch(std::exception & e) {
+      if (!instructions[pc].debug_location) {
+        throw;
+      }
+      auto msg = instructions[pc].debug_location->wrapException(e, "operation failed in interpreter");
+      if (dynamic_cast<JITException *>(&e)) {
+        throw JITException(msg);
+      } else {
+        throw std::runtime_error(msg);
+      }
+    }
+  }
+  if (future) {
+    auto num_outputs = function->preprocess.n_outputs;
+    if (num_outputs == 1) {
+      future->markCompleted(stack.back());
+    } else {
+      future->markCompleted(
+          Tuple::create(jit::last(stack, num_outputs).vec()));
     }
   }
 
-  // pc is critical for the interperter to pick up the progress from suspend
-  size_t pc = 0;
-  c10::intrusive_ptr<Future> future;
-  std::shared_ptr<CodeImpl> function; // keep function alive
-  // these are just copies of function to prevent indirections in interpreter
-  int * int_data;
-  const std::vector<bool> & bool_data;
+  return false;
+}
 
+c10::intrusive_ptr<Future> InterpreterStateImpl::getOrCreateFuture() {
+  if (!future) {
+    future = c10::make_intrusive<Future>();
+  }
+  return future;
+}
 
-  // this holds all the tensors for this interpreter run
-  // we don't bother minimizing the size of this vector, since the extra
-  // memory used by the pointers in this will be small
-  // instead we are very aggresive about releasing tensors when they become dead
-  // to make sure memory management happens efficiently.
+c10::intrusive_ptr<Future> InterpreterStateImpl::runAsync(
+    Stack& stack) {
+  getOrCreateFuture();
+  runImpl(stack);
+  return future;
+}
 
-  // We optimize for the case where derivatives are run with retain_graph=False
-  // in the case where it is true, then the interpreter and this array get copied
-  // if this every becomes a bottleneck then we _should_ consider minimizing the
-  // total number or register
-  std::vector<IValue> registers;
+void InterpreterStateImpl::run(Stack& stack) {
+  if (runImpl(stack)) {
+    future->wait();
 
-  // single buffer for input/output calls to ATen functions, so that we do not reallocate
-  Stack stack;
-};
+    auto num_outputs = function->preprocess.n_outputs;
+    if (num_outputs == 1) {
+      push(stack, future->value());
+    } else {
+      auto tuple = future->value().toTuple();
+      for (const auto& value : tuple->elements()) {
+        push(stack, value);
+      }
+    }
+  }
+}
 
 std::ostream & operator<<(std::ostream & out, const Code & code) {
   out << *code.pImpl->graph << "\n";
@@ -798,25 +776,21 @@ const std::vector<GraphExecutor*>& Code::grad_executors() {
 }
 
 InterpreterState::InterpreterState(const Code & code)
-  : pImpl(new InterpreterStateImpl(code)) {}
+  : pImpl(c10::make_intrusive<InterpreterStateImpl>(code)) {}
 InterpreterState::~InterpreterState() = default;
 
 void InterpreterState::run(Stack& stack) {
-  pImpl->run(stack, *this);
+  pImpl->run(stack);
 }
 
 c10::intrusive_ptr<Future> InterpreterState::runAsync(Stack& stack) {
-  return pImpl->runAsync(stack, *this);
-}
-
-InterpreterState InterpreterState::clone() const {
-  return InterpreterState(new InterpreterStateImpl(*pImpl));
+  return pImpl->runAsync(stack);
 }
 
 c10::intrusive_ptr<Future> InterpreterState::getFuture() {
   return pImpl->getOrCreateFuture();
 }
 
-InterpreterState::InterpreterState(InterpreterStateImpl * pImpl) : pImpl(pImpl) {}
+InterpreterState::InterpreterState(c10::intrusive_ptr<InterpreterStateImpl> pImpl) : pImpl(pImpl) {}
 
 }}
